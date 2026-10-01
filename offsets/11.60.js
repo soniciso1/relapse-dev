@@ -426,8 +426,8 @@ const OFFSET_KERNEL_UTOKEN_FLAGS = 0x01abc0f0;
 /* -- kernel, exploit-facing ------------------------------------------------ */
 
 window.KRW = {
-  firmware: "11.60",
     security_flags: OFFSET_KERNEL_SECURITY_FLAGS,  // KBASE-rel; target_id = +9 (devkit release-check)
+  firmware: "11.60",
 
   kernelData: OFFSET_KERNEL_DATA,
   allproc: OFFSET_KERNEL_ALLPROC,

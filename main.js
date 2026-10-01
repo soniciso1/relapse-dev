@@ -362,7 +362,6 @@ var LogLevel = {
 };
 
 let consoleElem = null;
-let lastLogIsTemp = false;
 
 function log(string, level) {
   if (consoleElem === null) {
@@ -371,6 +370,7 @@ function log(string, level) {
 
   const isTemp = level & LogLevel.FLAG_TEMP;
   level = level & ~LogLevel.FLAG_TEMP;
+
   const elemClass = [
     "LOG-DEBUG",
     "LOG-INFO",
@@ -380,18 +380,10 @@ function log(string, level) {
     "LOG-SUCCESS",
   ][level];
 
-  if (isTemp && lastLogIsTemp) {
-    const lastChild = consoleElem.lastChild;
-    lastChild.innerText = string;
-    lastChild.className = elemClass;
-    return;
-  } else if (isTemp) {
-    lastLogIsTemp = true;
-  } else {
-    lastLogIsTemp = false;
-  }
 
-  let logElem = document.createElement("div");
+  consoleElem.innerHTML = "";
+
+  const logElem = document.createElement("div");
   logElem.innerText = string;
   logElem.className = elemClass;
   consoleElem.appendChild(logElem);
@@ -885,19 +877,14 @@ async function main(userlandRW, wkOnly = false) {
   async function probe_sb_elfldr() {
     let fd =
       (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low << 0;
-    if (fd <= 0) {
-      return false;
-    }
+    if (fd <= 0) return false;
 
-    let addr = p.malloc(0x10);
+    let addr = p.malloc(0x10, 1);
     build_addr(p, addr, AF_INET, htons(9021), 0x0100007f);
-    let bind_res = (await chain.syscall(SYS_BIND, fd, addr, 0x10)).low << 0;
+    let connect_res =
+      (await chain.syscall(SYS_CONNECT, fd, addr, 0x10)).low << 0;
     await chain.syscall(SYS_CLOSE, fd);
-    if (bind_res < 0) {
-      return true;
-    }
-
-    return false;
+    return connect_res >= 0;
   }
 
   let is_elfldr_running = await probe_sb_elfldr();
@@ -911,26 +898,20 @@ async function main(userlandRW, wkOnly = false) {
     }
   }
 
-  // elfldr already up (operator running elfldr+klog) used to pop a confirm() offering to skip the
-  // kernel exploit and go sender-only -- which blocked ?go=1 auto-runs and jumped straight to the
-  // payload page. During aio-chain bring-up we WANT the exploit to run regardless of elfldr. The
-  // skip is now opt-in via ?senderok=1 (AIO_CFG.senderok); default runs the exploit.
-  if (!wkOnly && is_elfldr_running) {
-    if (window.AIO_CFG && AIO_CFG.senderok) {
-      await log(
-        "elfldr running + ?senderok=1 -> sender-only mode (exploit skipped)",
-        LogLevel.INFO,
-      );
-      wkOnly = true;
-    } else {
-      await log(
-        "elfldr running, but running the kernel exploit anyway (?senderok=1 to skip)",
-        LogLevel.INFO,
-      );
-    }
+  // Re-entry: an existing elfldr owns 9021, so never run the kernel exploit again.
+  if (is_elfldr_running) {
+    await log(
+      "elfldr already running on 9021 -> skipping kernel exploit; sender-only mode",
+      LogLevel.INFO,
+    );
+    wkOnly = true;
+    window.__elfldrUp = true;
+  } else if (wkOnly) {
+    throw new Error(
+      "Payload Sender requested, but elfldr is not listening on 127.0.0.1:9021. Run Jailbreak first.",
+    );
   }
 
-  populatePayloadsPage(wkOnly);
 
   var load_payload_into_elf_store_from_local_file = async function (filename) {
     await log("Loading ELF file: " + filename + " ...", LogLevel.LOG);
@@ -966,10 +947,49 @@ async function main(userlandRW, wkOnly = false) {
     SIZE_ELF_HEADER + SIZE_ELF_PROGRAM_HEADER * 0x10 + 0x1000000;
   var elf_store = p.malloc(elf_store_size, 1);
 
+  // Shared sender for both fresh and re-entry sessions.
+  const sendAddr = p.malloc(0x10, 1);
+  window.__sendPayload = async function (filename) {
+    const size = await load_payload_into_elf_store_from_local_file(filename);
+    if (!size) throw new Error("payload is empty: " + filename);
+
+    const sock =
+      (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low << 0;
+    if (sock <= 0) throw new Error("socket() failed");
+
+    build_addr(p, sendAddr, AF_INET, htons(9021), 0x0100007f);
+    const rv =
+      (await chain.syscall(SYS_CONNECT, sock, sendAddr, 0x10)).low << 0;
+    if (rv < 0) {
+      await chain.syscall(SYS_CLOSE, sock);
+      throw new Error("elfldr is not listening on 127.0.0.1:9021");
+    }
+
+    let sent = 0;
+    let ptr = elf_store.add32(0x0);
+    while (sent < size) {
+      const w =
+        (await chain.syscall(SYS_WRITE, sock, ptr, size - sent)).low << 0;
+      if (w <= 0) {
+        await chain.syscall(SYS_CLOSE, sock);
+        throw new Error("write failed after " + sent + " of " + size + " bytes");
+      }
+      sent += w;
+      ptr.add32inplace(w);
+    }
+    await chain.syscall(SYS_CLOSE, sock);
+    return sent;
+  };
+
   // kexp handoff flag: true once aio -> kexp -> elfldr succeeded. Then the
   // kernel-side shellcode brought elfldr up on 9021 and the in-browser JIT
   // loader (9020) is skipped; payloads go to 9021 instead.
   let kexpElfldr = false;
+
+  if (is_elfldr_running) {
+    await log("existing elfldr confirmed; returning to payload sender", LogLevel.INFO);
+    return;
+  }
 
   if (!wkOnly) {
     var krw;
@@ -998,52 +1018,6 @@ async function main(userlandRW, wkOnly = false) {
     if (krw && krw.done) {
       window.__elfldrUp = !!krw.elfldr;
 
-      /* In-page payload sender.
-       *
-       * elf.html is the standalone menu: zero exploit code, so it has no syscalls and
-       * has to ask the HOST to open tcp/9021 (api/payload/). That only works on a
-       * server that runs code AND can route to the console, i.e. ps-exploit-host or a
-       * LAN box - never a static host like GitHub Pages.
-       *
-       * This page still holds the primitives, so it can do what the rest of the family
-       * does: have the CONSOLE connect to its own elfldr on 127.0.0.1:9021 and write
-       * the ELF. No server involvement at all, so the payload menu works wherever the
-       * files are served from. Exposed here because chain, p and elf_store are in
-       * scope at exactly this point and nowhere later.
-       *
-       * Mirrors send_buffer_to_port() further down, which is unreachable legacy: the
-       * relapse chain returns from here, and the seven page helpers its payloads-view
-       * needs (switchPage, showToast, ...) are not defined anywhere in this site.
-       */
-      const sendAddr = p.malloc(0x10, 1);
-      window.__sendPayload = async function (filename) {
-        const size = await load_payload_into_elf_store_from_local_file(filename);
-        if (!size) throw new Error("payload is empty: " + filename);
-
-        const sock = (await chain.syscall(SYS_SOCKET, AF_INET, SOCK_STREAM, 0)).low << 0;
-        if (sock <= 0) throw new Error("socket() failed");
-        build_addr(p, sendAddr, AF_INET, htons(9021), 0x0100007f);   // 127.0.0.1
-        const rv = (await chain.syscall(SYS_CONNECT, sock, sendAddr, 0x10)).low << 0;
-        if (rv < 0) {
-          await chain.syscall(SYS_CLOSE, sock);
-          throw new Error("elfldr is not listening on 127.0.0.1:9021");
-        }
-
-        // Verbatim, no framing - elfldr sniffs the first bytes and needs ELF at 0.
-        let sent = 0;
-        const ptr = elf_store.add32(0x0);
-        while (sent < size) {
-          const w = (await chain.syscall(SYS_WRITE, sock, ptr, size - sent)).low << 0;
-          if (w <= 0) {
-            await chain.syscall(SYS_CLOSE, sock);
-            throw new Error("write failed after " + sent + " of " + size + " bytes");
-          }
-          sent += w;
-          ptr.add32inplace(w);
-        }
-        await chain.syscall(SYS_CLOSE, sock);
-        return sent;
-      };
       await log(
         krw.elfldr
           ? "kernel chain complete; elfldr is up on 127.0.0.1:9021"

@@ -96,6 +96,7 @@ const OFFSET_KERNEL_UTOKEN_FLAGS   = null;
 
 window.KRW = {
     firmware: "0.00",
+    security_flags: OFFSET_KERNEL_SECURITY_FLAGS,  // KBASE-rel; target_id = +9 (devkit release-check)
 
     kernelData: OFFSET_KERNEL_DATA,
     // LIST_HEAD of struct proc. Prove it with the LIST_INSERT_HEAD of proc0 in
